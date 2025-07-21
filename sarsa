@@ -1,0 +1,293 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+import random
+from collections import deque
+import time
+
+# Configuration
+GRID_SIZE = 50
+WALL_DENSITY = 0.25
+START = (0, 0)
+GOAL = (GRID_SIZE-1, GRID_SIZE-1)
+EPISODES = 2000  # Increased to allow more learning
+LEARNING_RATE = 0.001
+GAMMA = 0.99
+EPSILON_START = 1.0
+EPSILON_END = 0.01
+EPSILON_DECAY = 0.998  # Slower epsilon decay
+REPLAY_MEMORY_SIZE = 10000
+BATCH_SIZE = 64
+TARGET_UPDATE_FREQ = 10
+MAX_STEPS_PER_EPISODE = 500
+ACTIONS = [(0, 1), (1, 0), (0, -1), (-1, 0)]
+NUM_ACTIONS = len(ACTIONS)
+
+# Seed for reproducibility
+torch.manual_seed(42)
+np.random.seed(42)
+random.seed(42)
+
+class MazeEnvironment:
+    def __init__(self):
+        self.grid_size = GRID_SIZE
+        self.wall_density = WALL_DENSITY
+        self.reset()
+
+    def reset(self):
+        self.grid = np.zeros((GRID_SIZE, GRID_SIZE), dtype=int)
+        for r in range(GRID_SIZE):
+            for c in range(GRID_SIZE):
+                if (r, c) in [START, GOAL]:
+                    continue
+                if random.random() < WALL_DENSITY:
+                    self.grid[r, c] = 1
+        self.ensure_path_exists()
+        self.state = START
+        return self.get_state_representation(START)
+
+    def ensure_path_exists(self):
+        visited = np.zeros_like(self.grid, dtype=bool)
+        queue = deque([START])
+        visited[START] = True
+        while queue:
+            r, c = queue.popleft()
+            if (r, c) == GOAL:
+                return
+            for dr, dc in ACTIONS:
+                nr, nc = r + dr, c + dc
+                if 0 <= nr < GRID_SIZE and 0 <= nc < GRID_SIZE and not visited[nr, nc] and self.grid[nr, nc] == 0:
+                    visited[nr, nc] = True
+                    queue.append((nr, nc))
+        self.reset()
+
+    def get_state_representation(self, pos):
+        r, c = pos
+        view = np.zeros((5,5))
+        for i in range(-2, 3):
+            for j in range(-2, 3):
+                nr, nc = r+i, c+j
+                if 0 <= nr < GRID_SIZE and 0 <= nc < GRID_SIZE:
+                    view[i+2, j+2] = self.grid[nr, nc]
+                else:
+                    view[i+2, j+2] = 1  # boundary walls
+        rel_x = (GOAL[0] - r) / (GRID_SIZE-1)
+        rel_y = (GOAL[1] - c) / (GRID_SIZE-1)
+        return np.concatenate([view.flatten(), [rel_x, rel_y]])
+
+    def step(self, action):
+        dr, dc = ACTIONS[action]
+        r, c = self.state
+        nr, nc = r + dr, c + dc
+        if 0 <= nr < GRID_SIZE and 0 <= nc < GRID_SIZE and self.grid[nr, nc] == 0:
+            self.state = (nr, nc)
+            hit_wall = False
+        else:
+            hit_wall = True
+            nr, nc = r, c
+        done = (nr, nc) == GOAL
+        reward = 100.0 if done else -10.0 if hit_wall else -0.1
+        return self.get_state_representation(self.state), reward, done, (nr, nc)
+
+class QNetwork(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc1 = nn.Linear(27, 128)  # 5x5 view + 2 relative coordinates
+        self.fc2 = nn.Linear(128, 128)
+        self.fc3 = nn.Linear(128, NUM_ACTIONS)
+
+    def forward(self, x):
+        x = torch.relu(self.fc1(x))
+        x = torch.relu(self.fc2(x))
+        return self.fc3(x)
+
+class SARSAAgent:
+    def __init__(self):
+        self.epsilon = EPSILON_START
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.q_net = QNetwork().to(self.device)
+        self.target_net = QNetwork().to(self.device)
+        self.target_net.load_state_dict(self.q_net.state_dict())
+        self.target_net.eval()
+        self.optimizer = optim.Adam(self.q_net.parameters(), lr=LEARNING_RATE)
+        self.memory = deque(maxlen=REPLAY_MEMORY_SIZE)
+        self.episode_rewards = []
+        self.episode_steps = []
+        self.episode_success = []
+
+    def choose_action(self, state):
+        if random.random() < self.epsilon:
+            return random.randint(0, NUM_ACTIONS-1)
+        state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            return self.q_net(state_tensor).argmax().item()
+
+    def remember(self, state, action, reward, next_state, next_action, done):
+        self.memory.append((state, action, reward, next_state, next_action, done))
+
+    def replay(self):
+        if len(self.memory) < BATCH_SIZE:
+            return
+
+        # Convert batch components to NumPy arrays first
+        batch = random.sample(self.memory, BATCH_SIZE)
+        states, actions, rewards, next_states, next_actions, dones = zip(*batch)
+
+        # Convert to tensors efficiently
+        states = torch.tensor(np.array(states), dtype=torch.float32).to(self.device)
+        next_states = torch.tensor(np.array(next_states), dtype=torch.float32).to(self.device)
+        actions = torch.tensor(actions, dtype=torch.int64).to(self.device)
+        next_actions = torch.tensor(next_actions, dtype=torch.int64).to(self.device)
+        rewards = torch.tensor(rewards, dtype=torch.float32).to(self.device)
+        dones = torch.tensor(dones, dtype=torch.float32).to(self.device)
+
+        # Compute current Q values
+        q_values = self.q_net(states).gather(1, actions.unsqueeze(1)).squeeze(1)
+
+        # Compute target Q values
+        with torch.no_grad():
+            next_q = self.target_net(next_states).gather(1, next_actions.unsqueeze(1)).squeeze(1)
+        target_q = rewards + GAMMA * next_q * (1 - dones)
+
+        # Compute loss and optimize
+        loss = nn.MSELoss()(q_values, target_q)
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+    def train(self, env):
+        start = time.time()
+        for ep in range(EPISODES):
+            s = env.reset()
+            a = self.choose_action(s)
+            done, total_r, steps = False, 0, 0
+            while not done and steps < MAX_STEPS_PER_EPISODE:
+                ns, r, done, pos = env.step(a)
+                na = self.choose_action(ns)
+                self.remember(s, a, r, ns, na, done)
+                self.replay()
+                s, a = ns, na
+                total_r += r
+                steps += 1
+                if done:
+                    break
+
+            # Update target network periodically
+            if ep % TARGET_UPDATE_FREQ == 0:
+                self.target_net.load_state_dict(self.q_net.state_dict())
+
+            # Decay epsilon
+            self.epsilon = max(EPSILON_END, self.epsilon * EPSILON_DECAY)
+
+            # Record performance metrics
+            self.episode_rewards.append(total_r)
+            self.episode_steps.append(steps)
+            self.episode_success.append(1 if done and pos == GOAL else 0)
+
+            # Print progress
+            if (ep+1) % 100 == 0:
+                avg_success = np.mean(self.episode_success[-100:]) * 100
+                avg_reward = np.mean(self.episode_rewards[-100:])
+                print(f"Episode {ep+1}/{EPISODES}: Success Rate = {avg_success:.1f}%, "
+                      f"Avg Reward = {avg_reward:.1f}, Epsilon = {self.epsilon:.3f}")
+
+        print(f"Training completed in {time.time() - start:.1f} seconds")
+
+    def get_optimal_path(self, env):
+        env.reset()
+        pos = START
+        path = [pos]
+        for _ in range(GRID_SIZE*GRID_SIZE):
+            state = env.get_state_representation(pos)
+            state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(self.device)
+            with torch.no_grad():
+                action = self.q_net(state_tensor).argmax().item()
+            _, _, done, pos = env.step(action)
+            path.append(pos)
+            if done:
+                break
+        return path
+
+def visualize_maze(env, path=None):
+    grid = env.grid
+    fig, ax = plt.subplots(figsize=(10, 10))
+    ax.set_xlim(0, GRID_SIZE)
+    ax.set_ylim(0, GRID_SIZE)
+    ax.set_xticks([])
+    ax.set_yticks([])
+
+    # Draw walls
+    for r in range(GRID_SIZE):
+        for c in range(GRID_SIZE):
+            if grid[r, c] == 1:
+                ax.add_patch(patches.Rectangle((c, GRID_SIZE-1-r), 1, 1, color='black'))
+
+    # Draw path if provided
+    if path:
+        for r, c in path:
+            ax.add_patch(patches.Rectangle(
+                (c + 0.25, GRID_SIZE-1-r + 0.25), 0.5, 0.5,
+                color='yellow', alpha=0.7
+            ))
+
+    # Draw start and goal
+    ax.add_patch(patches.Circle(
+        (START[1] + 0.5, GRID_SIZE - 1 - START[0] + 0.5), 0.4, color='red'
+    ))
+    ax.add_patch(patches.Rectangle(
+        (GOAL[1], GRID_SIZE - 1 - GOAL[0]), 1, 1, color='green'
+    ))
+
+    plt.title("Maze with Optimal Path")
+    plt.show()
+
+def plot_training_stats(agent):
+    window = 50
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(10, 12))
+
+    # Plot rewards
+    rewards = np.convolve(agent.episode_rewards, np.ones(window)/window, mode='valid')
+    ax1.plot(rewards)
+    ax1.set_title('Reward')
+    ax1.grid()
+
+    # Plot steps
+    steps = np.convolve(agent.episode_steps, np.ones(window)/window, mode='valid')
+    ax2.plot(steps)
+    ax2.set_title('Steps')
+    ax2.grid()
+
+    # Plot success rate
+    success = np.convolve(agent.episode_success, np.ones(window)/window, mode='valid') * 100
+    ax3.plot(success)
+    ax3.set_title('Success Rate (%)')
+    ax3.grid()
+
+    plt.tight_layout()
+    plt.show()
+
+if __name__ == "__main__":
+    env = MazeEnvironment()
+    agent = SARSAAgent()
+    agent.train(env)
+
+    # Evaluate performance
+    success_rate = np.mean(agent.episode_success) * 100
+    avg_steps = np.mean(agent.episode_steps)
+    avg_reward = np.mean(agent.episode_rewards)
+
+    # Get and show optimal path
+    path = agent.get_optimal_path(env)
+    optimal_length = len(path) - 1
+
+    print("\nPerformance Summary:")
+    print(f"Success Rate: {success_rate:.1f}%")
+    print(f"Avg Steps: {avg_steps:.1f}")
+    print(f"Avg Reward: {avg_reward:.1f}")
+    print(f"Optimal Path Length: {optimal_length} steps")
+
+    visualize_maze(env, path)
+    plot_training_stats(agent)
